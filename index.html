@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>手势粒子交互</title>
+<style>
+  *, *::before, *::after { margin:0; padding:0; box-sizing:border-box; }
+  body {
+    background: #0a0a0f; overflow: hidden; font-family: 'Segoe UI', system-ui, sans-serif;
+    user-select: none; height: 100vh; width: 100vw;
+  }
+  canvas { display: block; position: fixed; top:0; left:0; z-index:1; }
+  video  { position: fixed; bottom:16px; right:16px; width:200px; border-radius:12px;
+           border:2px solid rgba(255,255,255,0.15); z-index:10; transform:scaleX(-1); opacity:0.7; }
+  .hud { position: fixed; top: 24px; left: 50%; transform: translateX(-50%); z-index: 10;
+         display: flex; gap: 16px; align-items: center; }
+  .gesture-badge {
+    background: rgba(255,255,255,0.06); backdrop-filter: blur(12px);
+    border: 1px solid rgba(255,255,255,0.12); border-radius: 100px;
+    padding: 10px 24px; color: #fff; font-size: 15px; transition: all 0.3s ease;
+  }
+  .gesture-badge.active { background: rgba(138,43,226,0.25); border-color: rgba(138,43,226,0.5);
+                          box-shadow: 0 0 24px rgba(138,43,226,0.3); }
+  .gesture-name { font-weight: 600; }
+  .gesture-hint { font-size: 12px; opacity:0.55; margin-top:2px; }
+  .status-dot { width:8px; height:8px; border-radius:50%; background:#ff4444; animation:pulse 1.5s infinite; }
+  .status-dot.tracking { background:#44ff44; }
+  @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.4} }
+  .start-overlay {
+    position: fixed; inset:0; z-index:100; display:flex; align-items:center;
+    justify-content:center; background:rgba(10,10,15,0.92); transition: opacity 0.5s;
+  }
+  .start-overlay.hidden { opacity:0; pointer-events:none; }
+  .start-btn {
+    background: linear-gradient(135deg, #6c3ce0, #a855f7); border:none; color:#fff;
+    font-size:18px; padding:16px 48px; border-radius:100px; cursor:pointer;
+    letter-spacing:1px; transition:transform 0.2s,box-shadow 0.2s;
+    box-shadow: 0 8px 32px rgba(108,60,224,0.4); display:block; margin:0 auto;
+  }
+  .start-btn:hover { transform:scale(1.04); box-shadow: 0 12px 40px rgba(108,60,224,0.6); }
+  #msg { color:rgba(255,255,255,0.6); font-size:14px; margin-top:16px; text-align:center; }
+</style>
+</head>
+<body>
+
+<canvas id="c"></canvas>
+<video id="v" autoplay playsinline></video>
+
+<div class="hud">
+  <div class="status-dot" id="dot"></div>
+  <div class="gesture-badge" id="badge">
+    <div class="gesture-name">等待检测...</div>
+    <div class="gesture-hint" id="hint">请将手放入摄像头范围</div>
+  </div>
+</div>
+
+<div class="start-overlay" id="overlay">
+  <div style="text-align:center">
+    <button class="start-btn" id="startBtn">开始体验</button>
+    <div id="msg">需要摄像头权限</div>
+  </div>
+</div>
+
+<script type="module">
+import { HandLandmarker, FilesetResolver } from './mediapipe/vision_bundle.mjs';
+
+// ── Canvas setup ──────────────────────────────
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+let W, H, cx, cy;
+function resize() {
+  W = canvas.width = window.innerWidth;
+  H = canvas.height = window.innerHeight;
+  cx = W / 2; cy = H / 2;
+}
+window.addEventListener('resize', resize);
+resize();
+
+// ── Particles (3D Sphere) ──────────────────────
+const PARTICLE_COUNT = 800;
+const SPHERE_RADIUS = () => Math.min(W, H) * 0.3;
+const particles = [];
+
+let angleY = 0, angleX = 0;
+let targetRotY = 0, targetRotX = 0;
+
+class Particle {
+  constructor(i) {
+    // Fibonacci sphere distribution
+    const phi = Math.acos(1 - 2 * (i + 0.5) / PARTICLE_COUNT);
+    const theta = Math.PI * (1 + Math.sqrt(5)) * i;
+    this.x3 = Math.sin(phi) * Math.cos(theta);
+    this.y3 = Math.cos(phi);
+    this.z3 = Math.sin(phi) * Math.sin(theta);
+    this.baseSize = Math.random() * 1.8 + 1.2;
+    this.baseHue = 250 + Math.random() * 70;
+    this.trail = [];
+    this.px = 0; this.py = 0;
+  }
+
+  update() {
+    // Rotate around Y axis (left/right)
+    const cosY = Math.cos(angleY), sinY = Math.sin(angleY);
+    const rx = this.x3 * cosY + this.z3 * sinY;
+    const rz = -this.x3 * sinY + this.z3 * cosY;
+
+    // Rotate around X axis (up/down)
+    const cosX = Math.cos(angleX), sinX = Math.sin(angleX);
+    const ry = this.y3 * cosX - rz * sinX;
+    const rz2 = this.y3 * sinX + rz * cosX;
+
+    const depth = (rz2 + 1.2) / 2.4;
+    const r = SPHERE_RADIUS();
+    this.px = cx + rx * r;
+    this.py = cy - ry * r;
+    this.size = this.baseSize * (0.45 + 0.55 * depth);
+    this.depth = depth;
+    this.hue = this.baseHue + depth * 30;
+
+    this.trail.push({ x: this.px, y: this.py });
+    if (this.trail.length > 6) this.trail.shift();
+  }
+
+  draw(ctx) {
+    const alpha = 0.35 + 0.65 * this.depth;
+    if (this.trail.length > 1) {
+      ctx.beginPath();
+      ctx.moveTo(this.trail[0].x, this.trail[0].y);
+      for (let i = 1; i < this.trail.length; i++) ctx.lineTo(this.trail[i].x, this.trail[i].y);
+      ctx.lineTo(this.px, this.py);
+      ctx.strokeStyle = `hsla(${this.hue}, 70%, 60%, ${alpha * 0.2})`;
+      ctx.lineWidth = this.size;
+      ctx.stroke();
+    }
+    const g = ctx.createRadialGradient(this.px, this.py, 0, this.px, this.py, this.size * 3.5);
+    g.addColorStop(0, `hsla(${this.hue}, 80%, 70%, ${alpha})`);
+    g.addColorStop(0.4, `hsla(${this.hue}, 70%, 55%, ${alpha * 0.55})`);
+    g.addColorStop(1, `hsla(${this.hue}, 60%, 50%, 0)`);
+    ctx.beginPath(); ctx.arc(this.px, this.py, this.size * 3.5, 0, Math.PI * 2);
+    ctx.fillStyle = g; ctx.fill();
+  }
+}
+
+for (let i = 0; i < PARTICLE_COUNT; i++) particles.push(new Particle(i));
+
+// ── DOM refs ──────────────────────────────────
+const video = document.getElementById('v');
+const dot = document.getElementById('dot');
+const badge = document.getElementById('badge');
+const hint = document.getElementById('hint');
+const overlay = document.getElementById('overlay');
+const msg = document.getElementById('msg');
+
+// ── Gesture recognition ───────────────────────
+function recognizeGesture(lm) {
+  const thumbOpen = Math.abs(lm[4].x - lm[2].x) > 0.06;
+  const iO = lm[8].y < lm[6].y - 0.02, mO = lm[12].y < lm[10].y - 0.02;
+  const rO = lm[16].y < lm[14].y - 0.02, pO = lm[20].y < lm[18].y - 0.02;
+  const allO = iO && mO && rO && pO, allC = !iO && !mO && !rO && !pO;
+  const pinch = Math.hypot(lm[4].x - lm[8].x, lm[4].y - lm[8].y);
+  if (pinch < 0.04) return 'pinch';
+  if (allO && thumbOpen) return 'open';
+  if (allC && !thumbOpen) return 'fist';
+  if (iO && !mO && !rO && !pO) return 'point';
+  if (iO && mO && !rO && !pO) return 'peace';
+  return 'open';
+}
+
+let lastGesture = 'open', gestureStable = 0;
+let handX = null, handY = null;
+
+function onHandResults(results) {
+  if (results.landmarks && results.landmarks.length > 0) {
+    const lm = results.landmarks[0];
+    const g = recognizeGesture(lm);
+    if (g === lastGesture) gestureStable++; else gestureStable = 0;
+    lastGesture = g;
+    const fg = gestureStable > 2 ? g : 'open';
+
+    handX = (1 - lm[0].x) * W;
+    handY = lm[0].y * H;
+
+    const names = { open: '✋ 张开手掌', fist: '✊ 握拳', point: '☝️ 食指指向', pinch: '🤏 捏合', peace: '✌️ 剪刀手' };
+    const hints = { open: '滑动旋转球体', fist: '滑动旋转球体', point: '滑动旋转球体', pinch: '滑动旋转球体', peace: '滑动旋转球体' };
+    document.querySelector('.gesture-name').textContent = names[fg] || fg;
+    hint.textContent = hints[fg] || '';
+    badge.classList.add('active');
+    dot.classList.add('tracking');
+  } else {
+    handX = null; handY = null;
+    badge.classList.remove('active');
+    dot.classList.remove('tracking');
+    document.querySelector('.gesture-name').textContent = '未检测到手';
+    hint.textContent = '请将手放入摄像头范围';
+  }
+}
+
+// ── Render ────────────────────────────────────
+function render() {
+  ctx.fillStyle = 'rgba(10,10,15,0.2)';
+  ctx.fillRect(0, 0, W, H);
+
+  // Drive rotation from hand position
+  if (handX !== null && handY !== null) {
+    const offsetX = (handX - cx) / cx; // -1 (left) to 1 (right)
+    const offsetY = (handY - cy) / cy; // -1 (top) to 1 (bottom)
+    targetRotY = offsetX * 2.5;
+    targetRotX = offsetY * 1.5;
+  } else {
+    targetRotY = 0;
+    targetRotX = 0;
+  }
+
+  // Smooth interpolation + auto-rotation when idle
+  const autoRotY = handX === null ? 0.002 : 0;
+  angleY += (targetRotY - angleY) * 0.08 + autoRotY;
+  angleX += (targetRotX - angleX) * 0.08;
+
+  // Sort by depth (back to front) for proper overlap
+  particles.forEach(p => p.update());
+  particles.sort((a, b) => a.depth - b.depth);
+  particles.forEach(p => p.draw(ctx));
+
+  // Hand glow
+  if (handX !== null && handY !== null) {
+    const hue = 270;
+    const glow = ctx.createRadialGradient(handX, handY, 0, handX, handY, 100);
+    glow.addColorStop(0, `hsla(${hue}, 80%, 65%, 0.2)`);
+    glow.addColorStop(0.5, `hsla(${hue}, 60%, 50%, 0.06)`);
+    glow.addColorStop(1, `hsla(${hue}, 50%, 40%, 0)`);
+    ctx.beginPath(); ctx.arc(handX, handY, 100, 0, Math.PI * 2);
+    ctx.fillStyle = glow; ctx.fill();
+    ctx.beginPath(); ctx.arc(handX, handY, 14, 0, Math.PI * 2);
+    ctx.strokeStyle = `hsla(${hue}, 80%, 70%, 0.5)`;
+    ctx.lineWidth = 2; ctx.stroke();
+  }
+
+  requestAnimationFrame(render);
+}
+render();
+
+// ── Init ──────────────────────────────────────
+let handLandmarker = null;
+async function init() {
+  try {
+    if (location.protocol !== 'https:' && location.hostname !== 'localhost' && location.hostname !== '127.0.0.1') {
+      msg.textContent = '⚠️ 非 HTTPS 环境无法使用摄像头，请用 localhost 访问';
+      return;
+    }
+    msg.textContent = '正在加载手势模型...';
+
+    const vision = await FilesetResolver.forVisionTasks('mediapipe');
+    handLandmarker = await HandLandmarker.createFromOptions(vision, {
+      baseOptions: {
+        modelAssetPath: 'mediapipe/hand_landmarker.task',
+        delegate: 'GPU'
+      },
+      runningMode: 'VIDEO',
+      numHands: 1
+    });
+
+    overlay.classList.add('hidden');
+
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480, facingMode: 'user' } });
+    video.srcObject = stream;
+    await video.play();
+
+    let lastTime = performance.now();
+    (function sendFrame() {
+      const now = performance.now();
+      if (handLandmarker && now - lastTime > 16) {
+        lastTime = now;
+        const results = handLandmarker.detectForVideo(video, now);
+        onHandResults(results);
+      }
+      requestAnimationFrame(sendFrame);
+    })();
+
+    document.querySelector('.gesture-name').textContent = '等待手势...';
+  } catch (e) {
+    console.error(e);
+    overlay.classList.remove('hidden');
+    msg.textContent = '❌ ' + (e.message || '无法访问摄像头，请允许权限');
+  }
+}
+
+document.getElementById('startBtn').addEventListener('click', e => { e.stopPropagation(); init(); });
+overlay.addEventListener('click', init);
+</script>
+</body>
+</html>
