@@ -83,6 +83,7 @@ const particles = [];
 
 let angleY = 0, angleX = 0;
 let targetRotY = 0, targetRotX = 0;
+let gestureSpread = 0, targetSpread = 0;
 
 class Particle {
   constructor(i) {
@@ -93,9 +94,12 @@ class Particle {
     this.y3 = Math.cos(phi);
     this.z3 = Math.sin(phi) * Math.sin(theta);
     this.baseSize = Math.random() * 1.8 + 1.2;
-    this.baseHue = 250 + Math.random() * 70;
+    this.baseHue = 190 + Math.random() * 80;
     this.trail = [];
     this.px = 0; this.py = 0;
+    this.explodeOx = (Math.random() - 0.5) * 2;
+    this.explodeOy = (Math.random() - 0.5) * 2;
+    this.explodeOz = (Math.random() - 0.5) * 2;
   }
 
   update() {
@@ -110,12 +114,22 @@ class Particle {
     const rz2 = this.y3 * sinX + rz * cosX;
 
     const depth = (rz2 + 1.2) / 2.4;
-    const r = SPHERE_RADIUS();
-    this.px = cx + rx * r;
-    this.py = cy - ry * r;
+    const baseR = SPHERE_RADIUS();
+    const spreadR = baseR * (1 + gestureSpread * 3.5);
+    const explodeAmount = gestureSpread * baseR * 4;
+
+    // Target: sphere position + explosion offset
+    const tx = cx + rx * spreadR + this.explodeOx * explodeAmount;
+    const ty = cy - ry * spreadR + this.explodeOy * explodeAmount;
+
+    // Smooth interpolation toward target
+    const lerp = 0.08 + gestureSpread * 0.04;
+    this.px += (tx - this.px) * lerp;
+    this.py += (ty - this.py) * lerp;
+
     this.size = this.baseSize * (0.45 + 0.55 * depth);
     this.depth = depth;
-    this.hue = this.baseHue + depth * 30;
+    this.hue = this.baseHue + depth * 25;
 
     this.trail.push({ x: this.px, y: this.py });
     if (this.trail.length > 6) this.trail.shift();
@@ -128,14 +142,14 @@ class Particle {
       ctx.moveTo(this.trail[0].x, this.trail[0].y);
       for (let i = 1; i < this.trail.length; i++) ctx.lineTo(this.trail[i].x, this.trail[i].y);
       ctx.lineTo(this.px, this.py);
-      ctx.strokeStyle = `hsla(${this.hue}, 70%, 60%, ${alpha * 0.2})`;
+      ctx.strokeStyle = `hsla(${this.hue}, 50%, 82%, ${alpha * 0.18})`;
       ctx.lineWidth = this.size;
       ctx.stroke();
     }
     const g = ctx.createRadialGradient(this.px, this.py, 0, this.px, this.py, this.size * 3.5);
-    g.addColorStop(0, `hsla(${this.hue}, 80%, 70%, ${alpha})`);
-    g.addColorStop(0.4, `hsla(${this.hue}, 70%, 55%, ${alpha * 0.55})`);
-    g.addColorStop(1, `hsla(${this.hue}, 60%, 50%, 0)`);
+    g.addColorStop(0, `hsla(${this.hue}, 55%, 85%, ${alpha})`);
+    g.addColorStop(0.4, `hsla(${this.hue}, 50%, 72%, ${alpha * 0.55})`);
+    g.addColorStop(1, `hsla(${this.hue}, 45%, 60%, 0)`);
     ctx.beginPath(); ctx.arc(this.px, this.py, this.size * 3.5, 0, Math.PI * 2);
     ctx.fillStyle = g; ctx.fill();
   }
@@ -168,6 +182,7 @@ function recognizeGesture(lm) {
 
 let lastGesture = 'open', gestureStable = 0;
 let handX = null, handY = null;
+let currentGesture = 'open';
 
 function onHandResults(results) {
   if (results.landmarks && results.landmarks.length > 0) {
@@ -179,9 +194,10 @@ function onHandResults(results) {
 
     handX = (1 - lm[0].x) * W;
     handY = lm[0].y * H;
+    currentGesture = fg;
 
     const names = { open: '✋ 张开手掌', fist: '✊ 握拳', point: '☝️ 食指指向', pinch: '🤏 捏合', peace: '✌️ 剪刀手' };
-    const hints = { open: '滑动旋转球体', fist: '滑动旋转球体', point: '滑动旋转球体', pinch: '滑动旋转球体', peace: '滑动旋转球体' };
+    const hints = { open: '粒子爆炸', fist: '聚合成球', point: '滑动旋转', pinch: '滑动旋转', peace: '滑动旋转' };
     document.querySelector('.gesture-name').textContent = names[fg] || fg;
     hint.textContent = hints[fg] || '';
     badge.classList.add('active');
@@ -200,21 +216,24 @@ function render() {
   ctx.fillStyle = 'rgba(10,10,15,0.2)';
   ctx.fillRect(0, 0, W, H);
 
-  // Drive rotation from hand position
+  // Drive rotation and spread from hand position & gesture
   if (handX !== null && handY !== null) {
-    const offsetX = (handX - cx) / cx; // -1 (left) to 1 (right)
-    const offsetY = (handY - cy) / cy; // -1 (top) to 1 (bottom)
+    const offsetX = (handX - cx) / cx;
+    const offsetY = (handY - cy) / cy;
     targetRotY = offsetX * 2.5;
     targetRotX = offsetY * 1.5;
+    // Gesture: fist → contract (0), open → explode (1)
+    targetSpread = currentGesture === 'fist' ? 0 : currentGesture === 'open' ? 1 : 0.3;
   } else {
-    targetRotY = 0;
-    targetRotX = 0;
+    targetRotY = 0; targetRotX = 0;
+    targetSpread = 0;
   }
 
-  // Smooth interpolation + auto-rotation when idle
+  // Smooth interpolation
   const autoRotY = handX === null ? 0.002 : 0;
   angleY += (targetRotY - angleY) * 0.08 + autoRotY;
   angleX += (targetRotX - angleX) * 0.08;
+  gestureSpread += (targetSpread - gestureSpread) * 0.06;
 
   // Sort by depth (back to front) for proper overlap
   particles.forEach(p => p.update());
@@ -223,15 +242,15 @@ function render() {
 
   // Hand glow
   if (handX !== null && handY !== null) {
-    const hue = 270;
+    const hue = 220;
     const glow = ctx.createRadialGradient(handX, handY, 0, handX, handY, 100);
-    glow.addColorStop(0, `hsla(${hue}, 80%, 65%, 0.2)`);
-    glow.addColorStop(0.5, `hsla(${hue}, 60%, 50%, 0.06)`);
-    glow.addColorStop(1, `hsla(${hue}, 50%, 40%, 0)`);
+    glow.addColorStop(0, `hsla(${hue}, 50%, 82%, 0.18)`);
+    glow.addColorStop(0.5, `hsla(${hue}, 45%, 70%, 0.05)`);
+    glow.addColorStop(1, `hsla(${hue}, 40%, 55%, 0)`);
     ctx.beginPath(); ctx.arc(handX, handY, 100, 0, Math.PI * 2);
     ctx.fillStyle = glow; ctx.fill();
     ctx.beginPath(); ctx.arc(handX, handY, 14, 0, Math.PI * 2);
-    ctx.strokeStyle = `hsla(${hue}, 80%, 70%, 0.5)`;
+    ctx.strokeStyle = `hsla(${hue}, 55%, 82%, 0.45)`;
     ctx.lineWidth = 2; ctx.stroke();
   }
 
